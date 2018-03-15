@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <time.h>
+#include <signal.h>
 
 /*stl*/
 #include <string>
@@ -43,5 +44,8 @@ using namespace std;
 #define SERVER_ERROR  (-1)
 
 #define SOCKET_BUF_SIZE (1024*1024)
+#define SOCKET_TIMEOUT  (15*1000)
+
+#define MAX_EVENT_NUMBER 10*1024
 
 #endif
