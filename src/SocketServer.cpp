@@ -16,44 +16,17 @@ SocketServer::~SocketServer(void)
 
 void SocketServer::S_WorkService(void* arg)
 {
-	SocketServer* pServer = (SocketServer*)arg;
-	pServer->WorkService();
+	int epollfd = *(int*)arg;
+	SOCKETServer::Instance()->WorkService(epollfd);
 }
 
-void SocketServer::WorkService()
+void SocketServer::WorkService(int epollfd)
 {
-	struct sockaddr_in client_address;
-	socklen_t client_addrlength = sizeof( client_address );
-	int sockfd = accept( m_bindsocket, ( struct sockaddr* )&client_address, &client_addrlength );
-	if(sockfd < 0)
-	{
-		DC_ERROR("accept error ,errmsg = %s",strerror(errno));
-		return ;
-	}
-	
-	char remoteAddress[INET_ADDRSTRLEN ] = {0};
-	inet_ntop( AF_INET, &client_address.sin_addr, remoteAddress, INET_ADDRSTRLEN );
-	int remotePort = ntohs( client_address.sin_port );
-	DC_INFO("%s:%d connect" , remoteAddress, remotePort );
-	
-	epoll_event events[ MAX_EVENT_NUMBER ];
-    int epollfd = epoll_create( 5 );
-	
-	if(0 != add_socket_epoll(epollfd, sockfd,true))
-	{
-		goto _exit;
-	}
-	
-	/*设置非阻塞*/
-	if(0 != make_socket_nonblock(sockfd))
-	{
-		goto _exit;
-	}
-	
+	epoll_event events[ MAX_EVENT_NUMBER ];	
 	 while( !m_bstop )
     {
         int event_num = epoll_wait( epollfd, events, MAX_EVENT_NUMBER, -1 );
-		if ( event_num < 0 )
+		if ( event_num < 0 && (errno != EINTR))
         {
 			DC_ERROR("epoll_wait error ,errmsg = %s",strerror(errno));
             break;
@@ -62,7 +35,15 @@ void SocketServer::WorkService()
 		for ( int i = 0; i < event_num; i++ )
         {
             int sock = events[i].data.fd;
-            if ( events[i].events & EPOLLIN &&(sock == sockfd))
+			
+			struct sockaddr_in client_address;
+			socklen_t client_addrlength = sizeof( client_address );
+			getpeername(sock, (struct sockaddr *)&client_address, &client_addrlength); 
+			char remoteAddress[INET_ADDRSTRLEN ] = {0};
+			inet_ntop( AF_INET, &client_address.sin_addr, remoteAddress, INET_ADDRSTRLEN );
+			int remotePort = ntohs( client_address.sin_port );
+			
+            if ( events[i].events & EPOLLIN )
             {
 				char* pRecvBuff = new  char[SOCKET_BUF_SIZE];
 				int nRemainDataSize = 0;
@@ -73,30 +54,40 @@ void SocketServer::WorkService()
 					{
 						if( ( errno == EAGAIN ) || ( errno == EWOULDBLOCK ) )
 						{
+							DC_INFO("recv %s:%d data size = %d" ,remoteAddress ,remotePort,nRemainDataSize);
 							 break;
 						}
 						DC_ERROR("socket errormsg = %s , %s:%d close",strerror(errno),remoteAddress ,remotePort);
-						goto _exit;
+						del_socket_epoll(epollfd,sock);
+						break;
 					}
 					else if (nBytesThisTime == 0)
 					{
 						DC_ERROR("socket errormsg = %s , %s:%d close",strerror(errno),remoteAddress ,remotePort);
-						goto _exit;
+						nRemainDataSize = 0;
+						del_socket_epoll(epollfd,sock);
+						break;
 					}
 					nRemainDataSize += nBytesThisTime;
 				 }
+				 //如果读取失败的话就直接返回
+				 if(nRemainDataSize == 0)
+				 {
+					 continue;
+				 }
 				
-				DC_INFO("recv data size = %d" ,nRemainDataSize);
+				DC_INFO("recv %s:%d data size = %d" ,remoteAddress ,remotePort,nRemainDataSize);
+				delete(pRecvBuff);pRecvBuff = NULL;
 				
-				if(0 != reset_socket_epoll(epollfd, sockfd))
+				if(0 != reset_socket_epoll(epollfd, sock))
 				{
-					goto _exit;
+					del_socket_epoll(epollfd,sock);
 				}
             }
             else if( events[i].events & ( EPOLLRDHUP | EPOLLHUP | EPOLLERR ) )
             {
                DC_ERROR("socket errormsg = %s , %s:%d close",strerror(errno),remoteAddress ,remotePort);
-			   goto _exit;
+			   del_socket_epoll(epollfd,sock);
             }
 			else
 			{
@@ -106,13 +97,11 @@ void SocketServer::WorkService()
 		
 	}
 	
-_exit:
-	del_socket_epoll(epollfd,sockfd);
-	close(sockfd);
 }
-int SocketServer::StartServer(int port)
+int SocketServer::StartServer(int port ,int threadNum )
 {
 	m_nport = port;
+	m_nThreadNum = threadNum;
 	
 	m_bindsocket = socket( PF_INET, SOCK_STREAM, 0 );
 	if(m_bindsocket < 0)
@@ -164,6 +153,16 @@ int SocketServer::StartServer(int port)
 		return SERVER_ERROR;
 	}
 	
+	/*创建工作线程以及对应的epoll句柄*/
+	for(int i = 0 ;i < m_nThreadNum ;i++)
+	{
+		int epollfd = epoll_create( 5 );
+		swartz_thread_detached_create((void*)S_WorkService, (void*)&epollfd, 0, 0);	
+		//休眠50ms ,保证工作线程里面的epollfd是正确的
+		usleep(50*1000);
+		m_EpollVec.push_back(epollfd);
+	}
+	
 	/*epoll 监听*/
     epoll_event events[ MAX_EVENT_NUMBER ];
     m_epollfd = epoll_create( 5 );
@@ -179,6 +178,7 @@ int SocketServer::StartServer(int port)
 	
     while( 1 )
     {
+		static int ClusterNum = 0;
         int event_num = epoll_wait( m_epollfd, events, MAX_EVENT_NUMBER, -1 );
         if ( event_num < 0 && (errno != EINTR))
         {
@@ -191,7 +191,31 @@ int SocketServer::StartServer(int port)
             int sockfd = events[i].data.fd;
             if ( sockfd == m_bindsocket )
             {
-				swartz_thread_detached_create((void*)S_WorkService, this, 0, 0);
+				struct sockaddr_in client_address;
+				socklen_t client_addrlength = sizeof( client_address );
+				int clientfd = accept( m_bindsocket, ( struct sockaddr* )&client_address, &client_addrlength );
+				if(clientfd < 0)
+				{
+					DC_ERROR("accept error ,errmsg = %s",strerror(errno));
+					continue ;
+				}
+				
+				char remoteAddress[INET_ADDRSTRLEN ] = {0};
+				inet_ntop( AF_INET, &client_address.sin_addr, remoteAddress, INET_ADDRSTRLEN );
+				int remotePort = ntohs( client_address.sin_port );
+				DC_INFO("%s:%d connect" , remoteAddress, remotePort );
+				
+				/*设置非阻塞*/
+				if(0 != make_socket_nonblock(clientfd))
+				{
+					continue;
+				}
+	
+				if(0 != add_socket_epoll(m_EpollVec[ClusterNum%m_nThreadNum], clientfd,true))
+				{
+					continue;
+				}
+				ClusterNum++;
             }
             else
             {
@@ -343,7 +367,7 @@ int SocketServer::del_socket_epoll(int epollfd ,int socket)
 		DC_ERROR("epoll_ctl  error ,errmsg = %s",strerror(errno));
 		return SERVER_ERROR;
 	}
-	close(epollfd);
+	close(socket);
 	return SERVER_OK;
 }
 

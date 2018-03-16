@@ -10,11 +10,11 @@ public:
 	~SocketServer(void);
 	
 public:
-	int StartServer(int port = 5001);
+	int StartServer(int port = 5001,int threadNum = 10);
 	void StopServer();	
 	
 	static void S_WorkService(void* arg);
-	void WorkService();
+	void WorkService(int epollfd);
 private:
 	int make_socket_nonblock(int sock);	
 	int make_socket_reuseable(int sock);
@@ -25,11 +25,12 @@ private:
 	int del_socket_epoll(int epollfd ,int socket);
 
 private:
-	bool           m_bstop;                 //是否关闭
-	int            m_nport;					//端口号
-	int            m_epollfd;               //epoll 句柄
-	int            m_bindsocket;            //监听的socket
-	
+	bool             m_bstop;                 //是否关闭
+	int            	 m_nport;				  //端口号
+	int            	 m_epollfd;               //主线程监听epoll 句柄
+	int           	 m_bindsocket;            //监听的socket
+	int           	 m_nThreadNum;            //接收数据工作线程的数量
+	std::vector<int> m_EpollVec ;             //工作线程的epoll句柄集
 };
 
 typedef singleton<SocketServer> SOCKETServer;
